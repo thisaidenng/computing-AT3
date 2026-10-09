@@ -372,6 +372,22 @@ void measure_offsets() {
   if (chassis.odom_tracker_front != nullptr) chassis.odom_tracker_front->distance_to_center_set(f_offset);
 }
 
+///
+// Place and back off: drive forward, lower arm, release claw, drive back
+///
+void place_and_back() {
+  chassis.pid_drive_set(30_cm, DRIVE_SPEED, true);
+  chassis.pid_wait();
+
+  armMoveTo(FIRST_DROP, S2_RETRACT, 1500);  // 1.5s timeout so a stuck arm can't stall the auton
+
+  clawOpen();
+  pros::delay(400);  // give the claw time to swing open
+
+  chassis.pid_drive_set(-30_cm, DRIVE_SPEED, true);
+  chassis.pid_wait();
+}
+
 // . . .
 // Make your own autonomous functions here!
 // . . .

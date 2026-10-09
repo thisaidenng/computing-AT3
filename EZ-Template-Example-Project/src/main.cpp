@@ -69,19 +69,20 @@ const int S2_STATE4   = 200;   // state 3
 // ______________________________ARM CONTROL______________________________
 // #########################################################################
 
-// state 0 = idle, 1, 2, 3
+// Stage 2 state (L1 cycles): 0 = idle, 1, 2, 3
 int      armState     = 0;
-int      armPhase     = 0;
 bool     armActive    = false;
 
+// Stage 1 manual speed (out of 127, full speed) — UP / DOWN arrows
+const int ARM_MANUAL_SPEED = 127;
+
 pros::Rotation   armRot(7);
-pros::MotorGroup armMotors({-1, 9});
+pros::MotorGroup armMotors({10});
 pros::Motor      secondStageMotor(12);
 
 void updateArm() {
   if (master.get_digital_new_press(DIGITAL_L1)) {
     armState = (armState + 1) % 4;
-    armPhase = 0;
     arm_last_target = -99999;
     s2_last_target  = -99999;
     armActive = true;
@@ -162,46 +163,62 @@ bool secondStageAt(int targetDeg) {
     return std::fabs(secondStageMotor.get_position() - targetDeg) < S2_TOL;
 }
 
-// Runs every loop.
-//   state 0: everything 0
+// Runs every loop. Stage 2 only — stage 1 is manual (see runFirstStageManual).
+//   state 0: second → 0
 //   state 1: second → S2_DEPLOY
-//   state 2: second → S2_RETRACT, THEN first → FIRST_UP
-//   state 3: first → FIRST_DROP, THEN (first → FIRST_UP AND second → S2_STATE4)
+//   state 2: second → S2_RETRACT
+//   state 3: second → S2_STATE4
 void runArm() {
     switch (armState) {
-
-        case 0:
-            moveFirstStage(0);
-            moveSecondStage(0);
-            break;
-
-        case 1:
-            moveFirstStage(0);
-            moveSecondStage(S2_DEPLOY);
-            break;
-
-        case 2:
-            if (armPhase == 0) {
-                moveFirstStage(0);
-                moveSecondStage(S2_RETRACT);
-                if (secondStageAt(S2_RETRACT)) armPhase = 1;
-            } else {
-                moveSecondStage(S2_RETRACT);
-                moveFirstStage(FIRST_UP);
-            }
-            break;
-
-        case 3:
-            if (armPhase == 0) {
-                moveSecondStage(S2_RETRACT);
-                moveFirstStage(FIRST_DROP);
-                if (firstStageAt(FIRST_DROP)) armPhase = 1;
-            } else {
-                moveFirstStage(FIRST_UP);
-                moveSecondStage(S2_STATE4);
-            }
-            break;
+        case 0: moveSecondStage(0);          break;
+        case 1: moveSecondStage(S2_DEPLOY);  break;
+        case 2: moveSecondStage(S2_RETRACT); break;
+        case 3: moveSecondStage(S2_STATE4);  break;
     }
+}
+
+// Stage 1 manual: hold UP to raise, DOWN to lower, release to hold position (brake HOLD)
+void runFirstStageManual() {
+    if (master.get_digital(DIGITAL_UP)) {
+        arm_out = ARM_MANUAL_SPEED;
+    } else if (master.get_digital(DIGITAL_DOWN)) {
+        arm_out = -ARM_MANUAL_SPEED;
+    } else {
+        arm_out = 0;
+    }
+    armMotors.move((int)arm_out);
+}
+
+// #########################################################################
+// ______________________________CLAW CONTROL______________________________
+// #########################################################################
+
+// Claw encoder is zeroed at startup, so the claw must be CLOSED when the robot boots.
+const int CLAW_CLOSED = 0;     // motor degrees
+const int CLAW_OPEN   = 180;   // motor degrees (spinning left opens; motor is reversed)
+const int CLAW_SPEED  = 150;   // rpm (5.5W motor maxes out at 200)
+
+void clawOpen()  { claw.move_absolute(CLAW_OPEN,   CLAW_SPEED); }
+void clawClose() { claw.move_absolute(CLAW_CLOSED, CLAW_SPEED); }
+
+// R1 = open, R2 = close
+void updateClaw() {
+  if (master.get_digital_new_press(DIGITAL_R1)) clawOpen();
+  if (master.get_digital_new_press(DIGITAL_R2)) clawClose();
+}
+
+// Blocking arm move for autons — runs both stage PIDs until both are on target or timeoutMs passes
+void armMoveTo(int firstTarget, int secondTarget, int timeoutMs) {
+  int elapsed = 0;
+  while (elapsed < timeoutMs) {
+    moveFirstStage(firstTarget);
+    moveSecondStage(secondTarget);
+    if (firstStageAt(firstTarget) && secondStageAt(secondTarget)) break;
+    pros::delay(ez::util::DELAY_TIME);
+    elapsed += ez::util::DELAY_TIME;
+  }
+  armMotors.brake();
+  secondStageMotor.brake();
 }
 
 /**
@@ -242,6 +259,8 @@ void initialize() {
   armRot.reset_position();
   armMotors.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
   secondStageMotor.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+  claw.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+  claw.tare_position();
 
   // These are already defaulted to these buttons, but you can change the left/right curve buttons here!
   // chassis.opcontrol_curve_buttons_left_set(pros::E_CONTROLLER_DIGITAL_LEFT, pros::E_CONTROLLER_DIGITAL_RIGHT);  // If using tank, only the left side is used.
@@ -249,6 +268,7 @@ void initialize() {
 
   // Autonomous Selector using LLEMU
   ez::as::auton_selector.autons_add({
+      {"Place and Back\n\nDrive 30cm, lower arm, open claw, back 30cm", place_and_back},
       {"Drive\n\nDrive forward and come back", drive_example},
       {"Turn\n\nTurn 3 times.", turn_example},
       {"Drive and Turn\n\nDrive forward, turn, come back", drive_and_turn},
@@ -324,7 +344,9 @@ void autonomous() {
   to be consistent
   */
 
-  ez::as::auton_selector.selected_auton_call();  // Calls selected auton from autonomous selector
+  // Always run Place and Back (selector bypassed). To use the brain-screen selector again,
+  // swap this back to: ez::as::auton_selector.selected_auton_call();
+  place_and_back();
 }
 
 /**
@@ -433,7 +455,6 @@ void opcontrol() {
   chassis.drive_brake_set(MOTOR_BRAKE_COAST);
 
   armState = 0;
-  armPhase = 0;
   armActive = false;
 
   while (true) {
@@ -443,8 +464,8 @@ void opcontrol() {
     // ---- Debug: everything on the brain screen ----
     pros::screen::print(pros::E_TEXT_MEDIUM, 0, "arm:%d s2:%d",
         armRot.get_position(), (int)secondStageMotor.get_position());
-    pros::screen::print(pros::E_TEXT_MEDIUM, 1, "st:%d ph:%d  tgt:%d",
-        armState, armPhase, FIRST_UP);
+    pros::screen::print(pros::E_TEXT_MEDIUM, 1, "st:%d",
+        armState);
     pros::screen::print(pros::E_TEXT_MEDIUM, 2, "1out:%d  2out:%d",
         (int)arm_out, (int)s2_out);
 
@@ -454,14 +475,16 @@ void opcontrol() {
       armMotors.brake();
       secondStageMotor.move(0);
       secondStageMotor.brake();
+      claw.brake();
       armState = 0;
-      armPhase = 0;
       armActive = false;
       continue;
     }
 
     updateArm();
     runArm();
+    runFirstStageManual();
+    updateClaw();
 
     pros::delay(ez::util::DELAY_TIME);
   }
