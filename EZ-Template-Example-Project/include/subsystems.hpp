@@ -1,11 +1,4 @@
 #pragma once
 
-#include "EZ-Template/api.hpp"
-#include "api.h"
-
-extern Drive chassis;
-
-// Your motors, sensors, etc. should go here.  Below are examples
-
-// inline pros::Motor intake(1);
-// inline pros::adi::DigitalIn limit_switch('A');
+// Nothing here yet — arm and claw live in autons.cpp
+// (since you don't use them in teleop).
