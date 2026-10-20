@@ -46,6 +46,7 @@ const int CLAW_STALL_MA      = 2000;   // mA — tune to your mechanism
 const int CLAW_STALL_TIME_MS = 100;    // how long current must stay high
 const int CLAW_TIMEOUT_MS    = 1500;   // safety max runtime
 const int CLAW_HOLD_PWR      = 20;     // hold torque after gripping
+const int CLAW_DRIVE_MS      = 600;    // how long open/close drives at full power — tune this
 
 // ##########################################################################
 // ______________________________HELPERS_____________________________________
@@ -93,15 +94,133 @@ void armMoveTo(int targetDeg, int timeout_ms = 3000) {
 void clawClose() {
     int dir = CLAW_POSITIVE_IS_CLOSE ? 1 : -1;
     clawMotor.move(127 * dir);
-    pros::delay(600);          // drive for 600ms — tune this
+    pros::delay(CLAW_DRIVE_MS);
     clawMotor.move(CLAW_HOLD_PWR * dir);
 }
 
 void clawOpen() {
     int dir = CLAW_POSITIVE_IS_CLOSE ? -1 : 1;
     clawMotor.move(127 * dir);
-    pros::delay(600);          // tune this
+    pros::delay(CLAW_DRIVE_MS);
     clawMotor.move(CLAW_HOLD_PWR * dir);
+}
+
+// -------- Arm + claw setup (called from initialize and autoSkills) --------
+void armClawSetup() {
+    armRot.set_reversed(true);
+    armRot.reset_position();
+    armMotors.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+    clawMotor.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+}
+
+// ##########################################################################
+// ______________________________TELEOP CONTROLS_____________________________
+// ##########################################################################
+//
+// Same arm PID and claw timing as the auton helpers above, but non-blocking:
+// each call does one step and returns, so the driver can keep driving.
+//
+//   L1 = arm up one position    (ARM_DOWN -> ARM_POS_1 -> ARM_POS_2)
+//   L2 = arm down one position
+//   R1 = open claw
+//   R2 = close claw
+
+const int ARM_POSITIONS[]   = {ARM_DOWN, ARM_POS_1, ARM_POS_2};
+const int ARM_NUM_POSITIONS = 3;
+
+int      teleArmIndex    = 0;
+bool     teleArmActive   = false;   // arm is left alone until the driver presses L1/L2
+double   teleArmIntegral = 0;
+double   teleArmPrevRaw  = 0;
+
+bool     teleClawDriving = false;
+int      teleClawDir     = 0;
+uint32_t teleClawStart   = 0;
+
+// Index of the arm position closest to where the arm is now
+int armNearestIndex() {
+    int raw = armRot.get_position();
+    int best = 0;
+    for (int i = 1; i < ARM_NUM_POSITIONS; i++) {
+        if (std::abs(raw - ARM_POSITIONS[i]) < std::abs(raw - ARM_POSITIONS[best])) best = i;
+    }
+    return best;
+}
+
+// One step of the arm PID toward targetDeg
+void armTeleopStep(int targetDeg) {
+    int raw = armRot.get_position();
+    if (raw == 2147483647) {   // sensor not connected
+        armMotors.move(0);
+        return;
+    }
+
+    double error = targetDeg - raw;
+
+    // Settled — hold with constant torque. ARM_DOWN releases.
+    if (std::fabs(error) < ARM_TOL) {
+        armMotors.move((targetDeg == ARM_DOWN) ? 0 : (int)ARM_HOLD_PWR);
+        teleArmPrevRaw = raw;
+        return;
+    }
+
+    teleArmIntegral += error;
+    double derivative = -(raw - teleArmPrevRaw);
+    teleArmPrevRaw = raw;
+
+    double out = ARM_KP * error + ARM_KI * teleArmIntegral + ARM_KD * derivative;
+
+    if (error > 0) out += ARM_FF;
+    else           out -= ARM_FF;
+
+    if (out > 0 && out < ARM_MIN_PWR) out = ARM_MIN_PWR;
+    if (out < 0 && out > -ARM_MIN_PWR) out = -ARM_MIN_PWR;
+    if (out >  127) out =  127;
+    if (out < -127) out = -127;
+
+    armMotors.move((int)out);
+}
+
+void clawTeleopStart(int dir) {
+    clawMotor.move(127 * dir);
+    teleClawDir     = dir;
+    teleClawStart   = pros::millis();
+    teleClawDriving = true;
+}
+
+// Call every opcontrol loop
+void armClawTeleop() {
+    bool up   = master.get_digital_new_press(DIGITAL_L1);
+    bool down = master.get_digital_new_press(DIGITAL_L2);
+
+    if (up || down) {
+        if (!teleArmActive) {
+            teleArmIndex  = armNearestIndex();
+            teleArmActive = true;
+        }
+        if (up   && teleArmIndex < ARM_NUM_POSITIONS - 1) teleArmIndex++;
+        if (down && teleArmIndex > 0)                     teleArmIndex--;
+        teleArmIntegral = 0;
+        teleArmPrevRaw  = armRot.get_position();
+    }
+
+    if (teleArmActive) armTeleopStep(ARM_POSITIONS[teleArmIndex]);
+
+    int closeDir = CLAW_POSITIVE_IS_CLOSE ? 1 : -1;
+    if (master.get_digital_new_press(DIGITAL_R1)) clawTeleopStart(-closeDir);  // open
+    if (master.get_digital_new_press(DIGITAL_R2)) clawTeleopStart(closeDir);   // close
+
+    // After CLAW_DRIVE_MS at full power, drop to hold torque (same as clawOpen/clawClose)
+    if (teleClawDriving && pros::millis() - teleClawStart > (uint32_t)CLAW_DRIVE_MS) {
+        clawMotor.move(CLAW_HOLD_PWR * teleClawDir);
+        teleClawDriving = false;
+    }
+}
+
+// Call after running an auton from opcontrol, so teleop doesn't yank the arm back
+void armClawTeleopReset() {
+    teleArmActive   = false;
+    teleClawDriving = false;
 }
 
 
@@ -149,13 +268,7 @@ void autoSkills() {
   chassis.odom_xyt_set(0_in, 0_in, 0_deg);
   chassis.drive_brake_set(MOTOR_BRAKE_HOLD);
 
-  // Arm setup
-  armRot.set_reversed(true);
-  armRot.reset_position();
-  armMotors.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
-
-  // Claw setup
-  clawMotor.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+  armClawSetup();
 
   // ---- Sequence ----
   armMoveTo(ARM_DOWN); 

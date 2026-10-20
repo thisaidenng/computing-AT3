@@ -35,6 +35,7 @@ void initialize() {
   chassis.opcontrol_curve_default_set(0.0, 0.0);
 
   default_constants();
+  armClawSetup();
 
   ez::as::auton_selector.autons_add({
       {"Auto Skills\n\nFull skills routine", autoSkills},
@@ -110,14 +111,21 @@ void opcontrol() {
   while (true) {
     chassis.opcontrol_tank();
 
+    // L1/L2 = arm positions, R1/R2 = claw open/close
+    armClawTeleop();
+
     // DOWN = run whichever auton is selected in the LLEMU menu
     if (master.get_digital_new_press(DIGITAL_DOWN)) {
       autonomous();
+      chassis.drive_brake_set(MOTOR_BRAKE_COAST);
+      armClawTeleopReset();
     }
 
     // LEFT = run autoSkills directly (ignores the LLEMU selection)
     if (master.get_digital_new_press(DIGITAL_LEFT)) {
       autoSkills();
+      chassis.drive_brake_set(MOTOR_BRAKE_COAST);
+      armClawTeleopReset();
     }
 
     pros::delay(ez::util::DELAY_TIME);
