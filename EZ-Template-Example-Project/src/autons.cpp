@@ -32,13 +32,14 @@ const int ARM_DOWN  = 0;
 const int ARM_POS_1 = 4000;
 const int ARM_POS_2 = 9000;
 
-// Arm PID (error is in centidegrees, so gains are small: 30° off = 3000 * 0.04 = 120 power)
-double ARM_KP = 0.04;         // raise if it stops short / is sluggish, lower if it overshoots
+// Arm PID
+double ARM_KP = 1.5;
 double ARM_KI = 0.0;
-double ARM_KD = 0.3;          // raise if it still bounces at the end of a move
-double ARM_TOL        = 200.0;   // 2.0° — counts as "there"
-double ARM_RESUME_TOL = 500.0;   // 5.0° — once parked, only correct again if it drifts this far
-double ARM_FF         = 12.0;    // gravity assist — always pushes UP (off when going to ARM_DOWN)
+double ARM_KD = 0.3;
+double ARM_TOL = 200.0;       // 2.0°
+double ARM_FF       = 12.0;   // gravity assist while moving
+double ARM_HOLD_PWR = 15.0;   // constant hold torque when parked
+const int ARM_MIN_PWR = 15;
 
 // Claw
 const int CLAW_STALL_MA      = 2000;   // mA — tune to your mechanism
@@ -51,67 +52,42 @@ const int CLAW_DRIVE_MS      = 600;    // how long open/close drives at full pow
 // ______________________________HELPERS_____________________________________
 // ##########################################################################
 
-// -------- Arm PID: shared by armMoveTo (auton) and armClawTeleop (teleop) --------
-double armIntegral = 0;
-double armPrevRaw  = 0;
-bool   armSettled  = false;
-
-// Call whenever the arm gets a new target
-void armPidReset() {
-    armIntegral = 0;
-    armPrevRaw  = armRot.get_position();
-    armSettled  = false;
-}
-
-// One PID step toward targetDeg. Returns true once the arm is parked on target.
-bool armStep(int targetDeg) {
-    int raw = armRot.get_position();
-    if (raw == 2147483647) {   // sensor not connected
-        armMotors.move(0);
-        return true;
-    }
-
-    double error = targetDeg - raw;
-
-    // Park inside ARM_TOL, and stay parked until it drifts past ARM_RESUME_TOL.
-    // The gap stops it flicking between "hold" and "correct" right at the edge.
-    double tol = armSettled ? ARM_RESUME_TOL : ARM_TOL;
-    if (std::fabs(error) < tol) {
-        armSettled = true;
-        armMotors.brake();     // brake mode is HOLD, so the motor locks this position itself
-        armPrevRaw = raw;
-        return true;
-    }
-    armSettled = false;
-
-    armIntegral += error;
-    double derivative = -(raw - armPrevRaw);
-    armPrevRaw = raw;
-
-    double out = ARM_KP * error + ARM_KI * armIntegral + ARM_KD * derivative;
-
-    // Gravity always pulls the arm down, so the assist always pushes up
-    if (targetDeg != ARM_DOWN) out += ARM_FF;
-
-    if (out >  127) out =  127;
-    if (out < -127) out = -127;
-
-    armMotors.move((int)out);
-    return false;
-}
-
 // -------- Arm: move to a target and block until settled or timeout --------
 void armMoveTo(int targetDeg, int timeout_ms = 3000) {
-    uint32_t start = pros::millis();
-    armPidReset();
+    double integral = 0;
+    double prev_raw = armRot.get_position();
+    uint32_t start  = pros::millis();
 
-    while (!armStep(targetDeg)) {
-        if ((int)(pros::millis() - start) > timeout_ms) {
-            armMotors.brake();   // timed out — hold wherever it got to
-            break;
-        }
+    while (true) {
+        int raw = armRot.get_position();
+        if (raw == 2147483647) break;   // sensor not connected
+
+        double error = targetDeg - raw;
+
+        if (std::fabs(error) < ARM_TOL) break;
+        if ((int)(pros::millis() - start) > timeout_ms) break;
+
+        integral += error;
+        double derivative = -(raw - prev_raw);
+        prev_raw = raw;
+
+        double out = ARM_KP * error + ARM_KI * integral + ARM_KD * derivative;
+
+        if (error > 0) out += ARM_FF;
+        else           out -= ARM_FF;
+
+        if (out > 0 && out < ARM_MIN_PWR) out = ARM_MIN_PWR;
+        if (out < 0 && out > -ARM_MIN_PWR) out = -ARM_MIN_PWR;
+        if (out >  127) out =  127;
+        if (out < -127) out = -127;
+
+        armMotors.move((int)out);
         pros::delay(10);
     }
+
+    // Settled — hold with constant torque. ARM_DOWN releases.
+    int hold = (targetDeg == ARM_DOWN) ? 0 : (int)ARM_HOLD_PWR;
+    armMotors.move(hold);
 }
 
 // -------- Claw: drive until stalled or timed out, then hold --------
@@ -154,6 +130,8 @@ const int ARM_NUM_POSITIONS = 3;
 
 int      teleArmIndex    = 0;
 bool     teleArmActive   = false;   // arm is left alone until the driver presses L1/L2
+double   teleArmIntegral = 0;
+double   teleArmPrevRaw  = 0;
 
 bool     teleClawDriving = false;
 int      teleClawDir     = 0;
@@ -167,6 +145,40 @@ int armNearestIndex() {
         if (std::abs(raw - ARM_POSITIONS[i]) < std::abs(raw - ARM_POSITIONS[best])) best = i;
     }
     return best;
+}
+
+// One step of the arm PID toward targetDeg
+void armTeleopStep(int targetDeg) {
+    int raw = armRot.get_position();
+    if (raw == 2147483647) {   // sensor not connected
+        armMotors.move(0);
+        return;
+    }
+
+    double error = targetDeg - raw;
+
+    // Settled — hold with constant torque. ARM_DOWN releases.
+    if (std::fabs(error) < ARM_TOL) {
+        armMotors.move((targetDeg == ARM_DOWN) ? 0 : (int)ARM_HOLD_PWR);
+        teleArmPrevRaw = raw;
+        return;
+    }
+
+    teleArmIntegral += error;
+    double derivative = -(raw - teleArmPrevRaw);
+    teleArmPrevRaw = raw;
+
+    double out = ARM_KP * error + ARM_KI * teleArmIntegral + ARM_KD * derivative;
+
+    if (error > 0) out += ARM_FF;
+    else           out -= ARM_FF;
+
+    if (out > 0 && out < ARM_MIN_PWR) out = ARM_MIN_PWR;
+    if (out < 0 && out > -ARM_MIN_PWR) out = -ARM_MIN_PWR;
+    if (out >  127) out =  127;
+    if (out < -127) out = -127;
+
+    armMotors.move((int)out);
 }
 
 void clawTeleopStart(int dir) {
@@ -188,10 +200,11 @@ void armClawTeleop() {
         }
         if (up   && teleArmIndex < ARM_NUM_POSITIONS - 1) teleArmIndex++;
         if (down && teleArmIndex > 0)                     teleArmIndex--;
-        armPidReset();
+        teleArmIntegral = 0;
+        teleArmPrevRaw  = armRot.get_position();
     }
 
-    if (teleArmActive) armStep(ARM_POSITIONS[teleArmIndex]);
+    if (teleArmActive) armTeleopStep(ARM_POSITIONS[teleArmIndex]);
 
     int closeDir = CLAW_POSITIVE_IS_CLOSE ? 1 : -1;
     if (master.get_digital_new_press(DIGITAL_R1)) clawTeleopStart(-closeDir);  // open
